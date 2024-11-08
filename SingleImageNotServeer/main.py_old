@@ -1,0 +1,231 @@
+import os
+import uuid
+import base64
+import logging
+from datetime import datetime
+from typing import Optional
+from io import BytesIO
+import asyncio
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from PIL import Image
+
+from OmniGen import OmniGenPipeline  # Ensure this is correctly installed and imported
+
+# Initialize Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# Configure CORS (adjust origins as necessary)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow requests from any origin (useful for development)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Define Request and Response Models
+class ImageGenerationRequest(BaseModel):
+    text: str
+    height: int = 1024
+    width: int = 1024
+    guidance_scale: float = 2.5
+    img_guidance_scale: float = 1.6
+    max_input_image_size: int = 1024
+    separate_cfg_infer: bool = True
+    use_kv_cache: bool = True
+    offload_kv_cache: bool = True
+    offload_model: bool = False
+    use_input_image_size_as_output: bool = False
+    seed: int = 0
+    inference_steps: int = 50
+    img1: Optional[str] = None  # Base64-encoded image string
+    img2: Optional[str] = None  # New field for second image
+    img3: Optional[str] = None  # New field for third image
+
+
+class ImageGenerationResponse(BaseModel):
+    image: str  # Base64-encoded generated image
+
+# Initialize the OmniGenPipeline
+CUSTOM_MODEL = "../Models/"  # Adjust the path as necessary
+try:
+    pipe = OmniGenPipeline.from_pretrained(CUSTOM_MODEL)
+    logger.info("OmniGenPipeline loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load OmniGenPipeline: {e}")
+    pipe = None  # Pipeline is not loaded; server should handle this gracefully
+
+# Task Queue Initialization
+task_queue = asyncio.Queue()
+
+# Helper Function to Generate Unique Filenames
+def generate_unique_filename(prefix: str = "input", extension: str = "png") -> str:
+    """
+    Generates a unique filename using UUID and current timestamp.
+
+    Args:
+        prefix (str): Prefix for the filename.
+        extension (str): File extension.
+
+    Returns:
+        str: Unique filename.
+    """
+    current_time = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    unique_id = uuid.uuid4().hex
+    return f"{prefix}_{current_time}_{unique_id}.{extension}"
+
+# Background Worker Function
+async def worker():
+    """
+    Background worker that processes image generation tasks sequentially.
+    """
+    while True:
+        task = await task_queue.get()
+        if task is None:
+            # None is the signal to stop the worker
+            logger.info("Worker received shutdown signal.")
+            break
+        await process_task(task)
+        task_queue.task_done()
+
+async def process_task(task):
+    """
+    Processes a single image generation task.
+
+    Args:
+        task (dict): Dictionary containing task details and a future to set the result.
+    """
+    request_data = task['data']
+    future = task['future']
+
+    if not pipe:
+        future.set_exception(HTTPException(status_code=500, detail="Model not loaded"))
+        return
+
+    input_images = []  # To store the paths of decoded images
+    image_paths = []   # Track file paths for cleanup
+
+    # Iterate over img1, img2, and img3 and decode if provided
+    for i, img_data in enumerate([request_data.img1, request_data.img2, request_data.img3], start=1):
+        if img_data:
+            try:
+                # Decode and save each image
+                image_data = base64.b64decode(img_data)
+                img = Image.open(BytesIO(image_data)).convert("RGB")
+                input_image_filename = generate_unique_filename(prefix=f"input_img{i}")
+                input_image_dir = "./input_images/"
+                os.makedirs(input_image_dir, exist_ok=True)
+                input_image_path = os.path.join(input_image_dir, input_image_filename)
+                img.save(input_image_path)
+                input_images.append(input_image_path)
+                image_paths.append(input_image_path)  # Track for later cleanup
+                logger.info(f"Saved input image {i} as {input_image_path}")
+            except Exception as e:
+                future.set_exception(HTTPException(status_code=400, detail="Invalid image data"))
+                return
+
+    try:
+        # Generate image using the OmniGen pipeline
+        output = pipe(
+            prompt=request_data.text,
+            input_images=input_images if input_images else None,
+            height=request_data.height,
+            width=request_data.width,
+            guidance_scale=request_data.guidance_scale,
+            img_guidance_scale=request_data.img_guidance_scale,
+            num_inference_steps=request_data.inference_steps,
+            separate_cfg_infer=request_data.separate_cfg_infer,
+            use_kv_cache=request_data.use_kv_cache,
+            offload_kv_cache=request_data.offload_kv_cache,
+            offload_model=request_data.offload_model,
+            use_input_image_size_as_output=request_data.use_input_image_size_as_output,
+            seed=request_data.seed,
+            max_input_image_size=request_data.max_input_image_size,
+        )
+        logger.info("Image generation successful.")
+        
+        # Convert the output image to Base64
+        img = output[0]
+        buffered = BytesIO()
+        img.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        future.set_result(ImageGenerationResponse(image=img_base64))
+    except Exception as e:
+        future.set_exception(HTTPException(status_code=500, detail="Image generation failed"))
+    finally:
+        # Cleanup: delete all saved input images after processing
+        for path in image_paths:
+            try:
+                os.remove(path)
+                logger.info(f"Deleted input image: {path}")
+            except Exception as e:
+                logger.warning(f"Could not delete input image {path}")
+
+# Startup Event: Start the Background Worker
+@app.on_event("startup")
+async def startup_event():
+    """
+    Starts the background worker when the server starts.
+    """
+    app.state.worker = asyncio.create_task(worker())
+    logger.info("Background worker started.")
+
+# Shutdown Event: Stop the Background Worker
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Stops the background worker when the server shuts down.
+    """
+    await task_queue.put(None)  # Send shutdown signal
+    await app.state.worker
+    logger.info("Background worker stopped.")
+
+# API Endpoint for Image Generation
+@app.post("/new-image/", response_model=ImageGenerationResponse)
+async def generate_image_endpoint(request: ImageGenerationRequest):
+    """
+    Endpoint to generate images based on the provided prompt and optional input image.
+
+    Args:
+        request (ImageGenerationRequest): The image generation request payload.
+
+    Returns:
+        ImageGenerationResponse: The response containing the generated image as a Base64 string.
+    """
+    logger.info("Received /new-image/ request.")
+
+    # Create a Future to wait for the task result
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+
+    # Enqueue the task
+    task = {
+        'data': request,
+        'future': future
+    }
+    await task_queue.put(task)
+    logger.info("Task enqueued.")
+
+    try:
+        # Wait for the task to be processed
+        response = await future
+        logger.info("Task completed successfully.")
+        return response
+    except HTTPException as he:
+        logger.error(f"HTTPException: {he.detail}")
+        raise he
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
